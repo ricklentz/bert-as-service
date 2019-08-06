@@ -24,7 +24,7 @@ from .http import BertHTTPProxy
 from .zmq_decor import multi_socket
 
 __all__ = ['__version__', 'BertServer']
-__version__ = '1.8.3'
+__version__ = '1.9.5'
 
 _tf_ver_ = check_tf_version()
 
@@ -32,6 +32,7 @@ _tf_ver_ = check_tf_version()
 class ServerCmd:
     terminate = b'TERMINATION'
     show_config = b'SHOW_CONFIG'
+    show_status = b'SHOW_STATUS'
     new_job = b'REGISTER'
     data_token = b'TOKENS'
     data_embed = b'EMBEDDINGS'
@@ -74,19 +75,41 @@ class BertServer(threading.Thread):
             self.logger.info('optimized graph is stored at: %s' % self.graph_path)
         else:
             raise FileNotFoundError('graph optimization fails and returns empty result')
+        self.is_ready = threading.Event()
+
+    def __enter__(self):
+        self.start()
+        self.is_ready.wait()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def close(self):
         self.logger.info('shutting down...')
         self._send_close_signal()
-        for p in self.processes:
-            p.close()
+        self.is_ready.clear()
         self.join()
 
     @zmqd.context()
     @zmqd.socket(zmq.PUSH)
     def _send_close_signal(self, _, frontend):
         frontend.connect('tcp://localhost:%d' % self.port)
-        frontend.send_multipart([b'', ServerCmd.terminate, b'', b''])
+        frontend.send_multipart([b'0', ServerCmd.terminate, b'0', b'0'])
+
+    @staticmethod
+    def shutdown(args):
+        with zmq.Context() as ctx:
+            ctx.setsockopt(zmq.LINGER, args.timeout)
+            with ctx.socket(zmq.PUSH) as frontend:
+                try:
+                    frontend.connect('tcp://%s:%d' % (args.ip, args.port))
+                    frontend.send_multipart([b'0', ServerCmd.terminate, b'0', b'0'])
+                    print('shutdown signal sent to %d' % args.port)
+                except zmq.error.Again:
+                    raise TimeoutError(
+                        'no response from the server (with "timeout"=%d ms), please check the following:'
+                        'is the server still online? is the network broken? are "port" correct? ' % args.timeout)
 
     def run(self):
         self._run()
@@ -133,18 +156,27 @@ class BertServer(threading.Thread):
 
         rand_backend_socket = None
         server_status = ServerStatistic()
+
+        for p in self.processes:
+            p.is_ready.wait()
+
+        self.is_ready.set()
+        self.logger.info('all set, ready to serve request!')
+
         while True:
             try:
                 request = frontend.recv_multipart()
                 client, msg, req_id, msg_len = request
-            except ValueError:
+                assert req_id.isdigit()
+                assert msg_len.isdigit()
+            except (ValueError, AssertionError):
                 self.logger.error('received a wrongly-formatted request (expected 4 frames, got %d)' % len(request))
                 self.logger.error('\n'.join('field %d: %s' % (idx, k) for idx, k in enumerate(request)), exc_info=True)
             else:
                 server_status.update(request)
                 if msg == ServerCmd.terminate:
                     break
-                elif msg == ServerCmd.show_config:
+                elif msg == ServerCmd.show_config or msg == ServerCmd.show_status:
                     self.logger.info('new config request\treq id: %d\tclient: %s' % (int(req_id), client))
                     status_runtime = {'client': client.decode('ascii'),
                                       'num_process': len(self.processes),
@@ -152,10 +184,10 @@ class BertServer(threading.Thread):
                                       'worker -> sink': addr_sink,
                                       'ventilator <-> sink': addr_front2sink,
                                       'server_current_time': str(datetime.now()),
-                                      'statistic': server_status.value,
                                       'device_map': device_map,
                                       'num_concurrent_socket': self.num_concurrent_socket}
-
+                    if msg == ServerCmd.show_status:
+                        status_runtime['statistic'] = server_status.value
                     sink.send_multipart([client, msg, jsonapi.dumps({**status_runtime,
                                                                      **self.status_args,
                                                                      **self.status_static}), req_id])
@@ -182,6 +214,8 @@ class BertServer(threading.Thread):
                     else:
                         push_new_job(job_id, msg, int(msg_len))
 
+        for p in self.processes:
+            p.close()
         self.logger.info('terminated!')
 
     def _get_device_map(self):
@@ -234,9 +268,11 @@ class BertSink(Process):
         self.max_seq_len = args.max_seq_len
         self.max_position_embeddings = bert_config.max_position_embeddings
         self.fixed_embed_length = args.fixed_embed_length
+        self.is_ready = multiprocessing.Event()
 
     def close(self):
         self.logger.info('shutting down...')
+        self.is_ready.clear()
         self.exit_flag.set()
         self.terminate()
         self.join()
@@ -268,6 +304,7 @@ class BertSink(Process):
         # inside the process for better compability
         logger = set_logger(colored('SINK', 'green'), self.verbose)
         logger.info('ready')
+        self.is_ready.set()
 
         while not self.exit_flag.is_set():
             socks = dict(poller.poll())
@@ -296,18 +333,6 @@ class BertSink(Process):
                                                                 pending_jobs[job_id].progress_tokens,
                                                                 pending_jobs[job_id].checksum))
 
-                # check if there are finished jobs, then send it back to workers
-
-                finished = [(k, v) for k, v in pending_jobs.items() if v.is_done]
-                for job_info, tmp in finished:
-                    client_addr, req_id = job_info.split(b'#')
-                    x, x_info = tmp.result
-                    sender.send_multipart([client_addr, x_info, x, req_id])
-                    logger.info('send back\tsize: %d\tjob id: %s' % (tmp.checksum, job_info))
-                    # release the job
-                    tmp.clear()
-                    pending_jobs.pop(job_info)
-
             if socks.get(frontend) == zmq.POLLIN:
                 client_addr, msg_type, msg_info, req_id = frontend.recv_multipart()
                 if msg_type == ServerCmd.new_job:
@@ -315,10 +340,24 @@ class BertSink(Process):
                     # register a new job
                     pending_jobs[job_info].checksum = int(msg_info)
                     logger.info('job register\tsize: %d\tjob id: %s' % (int(msg_info), job_info))
-                elif msg_type == ServerCmd.show_config:
+                    if len(pending_jobs[job_info]._pending_embeds)>0 \
+                            and pending_jobs[job_info].final_ndarray is None:
+                        pending_jobs[job_info].add_embed(None, 0)
+                elif msg_type == ServerCmd.show_config or msg_type == ServerCmd.show_status:
                     time.sleep(0.1)  # dirty fix of slow-joiner: sleep so that client receiver can connect.
                     logger.info('send config\tclient %s' % client_addr)
                     sender.send_multipart([client_addr, msg_info, req_id])
+
+            # check if there are finished jobs, then send it back to workers
+            finished = [(k, v) for k, v in pending_jobs.items() if v.is_done]
+            for job_info, tmp in finished:
+                client_addr, req_id = job_info.split(b'#')
+                x, x_info = tmp.result
+                sender.send_multipart([client_addr, x_info, x, req_id])
+                logger.info('send back\tsize: %d\tjob id: %s' % (tmp.checksum, job_info))
+                # release the job
+                tmp.clear()
+                pending_jobs.pop(job_info)
 
 
 class SinkJob:
@@ -360,19 +399,29 @@ class SinkJob:
             self.progress_embeds += progress
             if data.shape[1] > self.max_effective_len:
                 self.max_effective_len = data.shape[1]
-
-        progress = data.shape[0]
+        if data is not None: # when job finish msg come to SINK earlier than job register
+            progress = data.shape[0]
+        else:
+            progress = 0
         if not self.checksum:
             self._pending_embeds.append((data, pid, progress))
         else:
             if self.final_ndarray is None:
-                d_shape = list(data.shape[1:])
+                if data is not None: # when job finish msg come to SINK earlier than job register
+                    d_shape = list(data.shape[1:])
+                else:
+                    d_shape = list(self._pending_embeds[0][0].shape[1:])
                 if self.max_seq_len_unset and len(d_shape) > 1:
                     # if not set max_seq_len, then we have no choice but set result ndarray to
                     # [B, max_position_embeddings, dim] and truncate it at the end
                     d_shape[0] = self.max_position_embeddings
-                self.final_ndarray = np.zeros([self.checksum] + d_shape, dtype=data.dtype)
-            fill_data()
+                if data is not None:
+                    dtype = data.dtype
+                else:
+                    dtype = self._pending_embeds[0][0].dtype
+                self.final_ndarray = np.zeros([self.checksum] + d_shape, dtype=dtype)
+            if data is not None: # when job finish msg come to SINK earlier than job register
+                fill_data()
             while self._pending_embeds:
                 data, pid, progress = self._pending_embeds.pop()
                 fill_data()
@@ -410,6 +459,7 @@ class BertWorker(Process):
         self.device_id = device_id
         self.logger = set_logger(colored('WORKER-%d' % self.worker_id, 'yellow'), args.verbose)
         self.max_seq_len = args.max_seq_len
+        self.do_lower_case = args.do_lower_case
         self.mask_cls_sep = args.mask_cls_sep
         self.daemon = True
         self.exit_flag = multiprocessing.Event()
@@ -424,10 +474,12 @@ class BertWorker(Process):
         self.bert_config = graph_config
         self.use_fp16 = args.fp16
         self.show_tokens_to_client = args.show_tokens_to_client
+        self.is_ready = multiprocessing.Event()
 
     def close(self):
         self.logger.info('shutting down...')
         self.exit_flag.set()
+        self.is_ready.clear()
         self.terminate()
         self.join()
         self.logger.info('terminated!')
@@ -494,16 +546,17 @@ class BertWorker(Process):
         from .bert.tokenization import FullTokenizer
 
         def gen():
-            tokenizer = FullTokenizer(vocab_file=os.path.join(self.model_dir, 'vocab.txt'))
             # Windows does not support logger in MP environment, thus get a new logger
             # inside the process for better compatibility
             logger = set_logger(colored('WORKER-%d' % self.worker_id, 'yellow'), self.verbose)
+            tokenizer = FullTokenizer(vocab_file=os.path.join(self.model_dir, 'vocab.txt'), do_lower_case=self.do_lower_case)
 
             poller = zmq.Poller()
             for sock in socks:
                 poller.register(sock, zmq.POLLIN)
 
             logger.info('ready and listening!')
+            self.is_ready.set()
 
             while not self.exit_flag.is_set():
                 events = dict(poller.poll())
@@ -546,9 +599,9 @@ class BertWorker(Process):
 
 class ServerStatistic:
     def __init__(self):
-        self._hist_client = defaultdict(int)
+        self._hist_client = CappedHistogram(500)
         self._hist_msg_len = defaultdict(int)
-        self._client_last_active_time = defaultdict(float)
+        self._client_last_active_time = CappedHistogram(500)
         self._num_data_req = 0
         self._num_sys_req = 0
         self._num_total_seq = 0
@@ -576,14 +629,16 @@ class ServerStatistic:
 
     @property
     def value(self):
-        def get_min_max_avg(name, stat):
+        def get_min_max_avg(name, stat, avg=None):
             if len(stat) > 0:
+                avg = sum(stat) / len(stat) if avg is None else avg
+                min_, max_ = min(stat), max(stat)
                 return {
-                    'avg_%s' % name: sum(stat) / len(stat),
-                    'min_%s' % name: min(stat),
-                    'max_%s' % name: max(stat),
-                    'num_min_%s' % name: sum(v == min(stat) for v in stat),
-                    'num_max_%s' % name: sum(v == max(stat) for v in stat),
+                    'avg_%s' % name: avg,
+                    'min_%s' % name: min_,
+                    'max_%s' % name: max_,
+                    'num_min_%s' % name: sum(v == min_ for v in stat),
+                    'num_max_%s' % name: sum(v == max_ for v in stat),
                 }
             else:
                 return {}
@@ -593,15 +648,19 @@ class ServerStatistic:
             now = time.perf_counter()
             return sum(1 for v in self._client_last_active_time.values() if (now - v) < interval)
 
+        avg_msg_len = None
+        if len(self._hist_msg_len) > 0:
+            avg_msg_len = sum(k*v for k,v in self._hist_msg_len.items()) / sum(self._hist_msg_len.values())
+
         parts = [{
             'num_data_request': self._num_data_req,
             'num_total_seq': self._num_total_seq,
             'num_sys_request': self._num_sys_req,
             'num_total_request': self._num_data_req + self._num_sys_req,
-            'num_total_client': len(self._hist_client),
+            'num_total_client': self._hist_client.total_size(),
             'num_active_client': get_num_active_client()},
-            get_min_max_avg('request_per_client', self._hist_client.values()),
-            get_min_max_avg('size_per_request', self._hist_msg_len.keys()),
+            self._hist_client.get_stat_map('request_per_client'),
+            get_min_max_avg('size_per_request', self._hist_msg_len.keys(), avg=avg_msg_len),
             get_min_max_avg('last_two_interval', self._last_two_req_interval),
             get_min_max_avg('request_per_second', [1. / v for v in self._last_two_req_interval]),
         ]

@@ -183,10 +183,11 @@ The best way to learn `bert-as-service` **latest API** is [reading the documenta
 
 ### Server API
 
-[Please always refer to the latest server-side API documented here.](https://bert-as-service.readthedocs.io/en/latest/source/server.html#server-side-api)
-Server-side is a CLI `bert-serving-start`, you can get the latest usage via:
+[Please always refer to the latest server-side API documented here.](https://bert-as-service.readthedocs.io/en/latest/source/server.html#server-side-api), you may get the latest usage via:
 ```bash
 bert-serving-start --help
+bert-serving-terminate --help
+bert-serving-benchmark --help
 ```
 
 | Argument | Type | Default | Description |
@@ -197,6 +198,7 @@ bert-serving-start --help
 | `config_name`| str | `bert_config.json` | filename of the JSON config file for BERT model. |
 | `graph_tmp_dir` | str | None | path to graph temp file |  
 | `max_seq_len` | int | `25` | maximum length of sequence, longer sequence will be trimmed on the right side. Set it to NONE for dynamically using the longest sequence in a (mini)batch. |
+| `cased_tokenization` | bool | False | Whether tokenizer should skip the default lowercasing and accent removal. Should be used for e.g. the multilingual cased pretrained BERT model. |
 | `mask_cls_sep` | bool | False | masking the embedding on [CLS] and [SEP] with zero. |
 | `num_worker` | int | `1` | number of (GPU/CPU) worker runs BERT model, each works in a separate process. |
 | `max_batch_size` | int | `256` | maximum number of sequences handled by each worker, larger batch will be partitioned into small batches. |
@@ -296,8 +298,8 @@ Finally, we are ready to receive new query and perform a simple "fuzzy" search a
 while True:
     query = input('your question: ')
     query_vec = bc.encode([query])[0]
-    # compute simple dot product as score
-    score = np.sum(query_vec * doc_vecs, axis=1)
+    # compute normalized dot product as score
+    score = np.sum(query_vec * doc_vecs, axis=1) / np.linalg.norm(doc_vecs, axis=1)
     topk_idx = np.argsort(score)[::-1][:topk]
     for idx in topk_idx:
         print('> %s\t%s' % (score[idx], questions[idx]))
@@ -696,6 +698,18 @@ server.start()
 
 Note that it's basically mirroring the arg-parsing behavior in CLI, so everything in that `.parse_args([])` list should be string, e.g. `['-port', '5555']` not `['-port', 5555]`.
 
+To shutdown the server, you may call the static method in `BertServer` class via:
+```python
+BertServer.shutdown(port=5555)
+```
+
+Or via shell CLI:
+```bash
+bert-serving-terminate -port 5555
+```
+
+This will terminate the server running on localhost at port 5555. You may also use it to terminate a remote server, see `bert-serving-terminate --help` for details.
+
 
 <h2 align="center">:speech_balloon: FAQ</h2>
 <p align="right"><a href="#bert-as-service"><sup>▴ Back to top</sup></a></p>
@@ -726,12 +740,12 @@ In general, each sentence is translated to a 768-dimensional vector. Depending o
 **A:** Sure! Just use a list of the layer you want to concatenate when calling the server. Example:
 
 ```bash
-bert_serving_start -pooling_layer -4 -3 -2 -1 -model_dir /tmp/english_L-12_H-768_A-12/
+bert-serving-start -pooling_layer -4 -3 -2 -1 -model_dir /tmp/english_L-12_H-768_A-12/
 ```
 
 ##### **Q:** What are the available pooling strategies?
 
-**A:** Here is a table summarizes all pooling strategies I implemented. Choose your favorite one by specifying `bert_serving_start -pooling_strategy`.
+**A:** Here is a table summarizes all pooling strategies I implemented. Choose your favorite one by specifying `bert-serving-start -pooling_strategy`.
 
 |Strategy|Description|
 |---|---|
@@ -779,7 +793,7 @@ No, not at all. Just do `encode` and let the server handles the rest. If the bat
 
 ##### **Q:** How many requests can one service handle concurrently?
 
-**A:** The maximum number of concurrent requests is determined by `num_worker` in `bert_serving_start`. If you a sending more than `num_worker` requests concurrently, the new requests will be temporally stored in a queue until a free worker becomes available.
+**A:** The maximum number of concurrent requests is determined by `num_worker` in `bert-serving-start`. If you a sending more than `num_worker` requests concurrently, the new requests will be temporally stored in a queue until a free worker becomes available.
 
 ##### **Q:** So one request means one sentence?
 

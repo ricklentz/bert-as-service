@@ -4,13 +4,16 @@ import os
 import sys
 import time
 import uuid
+import warnings
+from collections import OrderedDict
+
 
 import zmq
 from termcolor import colored
 from zmq.utils import jsonapi
 
 __all__ = ['set_logger', 'send_ndarray', 'get_args_parser',
-           'check_tf_version', 'auto_bind', 'import_tf', 'TimeContext']
+           'check_tf_version', 'auto_bind', 'import_tf', 'TimeContext', 'CappedHistogram']
 
 
 def set_logger(context, verbose=False):
@@ -72,7 +75,7 @@ def get_args_parser():
     from . import __version__
     from .graph import PoolingStrategy
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='Start a BertServer for serving')
 
     group1 = parser.add_argument_group('File Paths',
                                        'config the path, checkpoint and filename of a pretrained/fine-tuned BERT model')
@@ -93,6 +96,9 @@ def get_args_parser():
     group2.add_argument('-max_seq_len', type=check_max_seq_len, default=25,
                         help='maximum length of a sequence, longer sequence will be trimmed on the right side. '
                              'set it to NONE for dynamically using the longest sequence in a (mini)batch.')
+    group2.add_argument('-cased_tokenization', dest='do_lower_case', action='store_false', default=True,
+                        help='Whether tokenizer should skip the default lowercasing and accent removal.'
+                             'Should be used for e.g. the multilingual cased pretrained BERT model.')
     group2.add_argument('-pooling_layer', type=int, nargs='+', default=[-2],
                         help='the encoder layer(s) that receives pooling. \
                         Give a list in order to concatenate several layers into one')
@@ -157,7 +163,11 @@ def get_args_parser():
 def check_tf_version():
     import tensorflow as tf
     tf_ver = tf.__version__.split('.')
-    assert int(tf_ver[0]) >= 1 and int(tf_ver[1]) >= 10, 'Tensorflow >=1.10 is required!'
+    if int(tf_ver[0]) <= 1 and int(tf_ver[1]) < 10:
+        raise ModuleNotFoundError('Tensorflow >=1.10 (one-point-ten) is required!')
+    elif int(tf_ver[0]) > 1:
+        warnings.warn('Tensorflow %s is not tested! It may or may not work. '
+                      'Feel free to submit an issue at https://github.com/hanxiao/bert-as-service/issues/' % tf.__version__)
     return tf_ver
 
 
@@ -198,6 +208,7 @@ def get_run_args(parser_fn=get_args_parser, printed=True):
 
 def get_benchmark_parser():
     parser = get_args_parser()
+    parser.description = 'Benchmark BertServer locally'
 
     parser.set_defaults(num_client=1, client_batch_size=4096)
 
@@ -219,6 +230,19 @@ def get_benchmark_parser():
     return parser
 
 
+def get_shutdown_parser():
+    parser = argparse.ArgumentParser()
+    parser.description = 'Shutting down a BertServer instance running on a specific port'
+
+    parser.add_argument('-ip', type=str, default='localhost',
+                        help='the ip address that a BertServer is running on')
+    parser.add_argument('-port', '-port_in', '-port_data', type=int, required=True,
+                        help='the port that a BertServer is running on')
+    parser.add_argument('-timeout', type=int, default=5000,
+                        help='timeout (ms) for connecting to a server')
+    return parser
+
+
 class TimeContext:
     def __init__(self, msg):
         self._msg = msg
@@ -230,3 +254,83 @@ class TimeContext:
     def __exit__(self, typ, value, traceback):
         self.duration = time.perf_counter() - self.start
         print(colored('    [%3.3f secs]' % self.duration, 'green'), flush=True)
+
+class CappedHistogram:
+    """Space capped dict with aggregate stat tracking.
+
+    Evicts using LRU policy when at capacity; evicted elements are added to aggregate stats.
+    Arguments:
+    capacity -- the capacity limit of the dict
+    """
+    def __init__(self, capacity):
+        self.cache = OrderedDict()
+        self.capacity = capacity
+        self.base_bins = 0
+        self.base_count = 0
+        self.base_min = float('inf')
+        self.min_count = 0
+        self.base_max = 0
+        self.max_count = 0
+
+    def __getitem__(self, key):
+        if key in self.cache:
+            return self.cache[key]
+        return 0
+
+    def __setitem__(self, key, value):
+        if key in self.cache:
+            del self.cache[key]
+        self.cache[key] = value
+        if len(self.cache) > self.capacity:
+            self._evict()
+
+    def total_size(self):
+        return self.base_bins + len(self.cache)
+
+    def __len__(self):
+        return len(self.cache)
+
+    def values(self):
+        return self.cache.values()
+
+    def _evict(self):
+        key,val = self.cache.popitem(False)
+        self.base_bins += 1
+        self.base_count += val
+        if val < self.base_min:
+            self.base_min = val
+            self.min_count = 1
+        elif val == self.base_min:
+            self.min_count += 1
+        if val > self.base_max:
+            self.base_max = val
+            self.max_count = 1
+        elif val == self.base_max:
+            self.max_count += 1
+
+    def get_stat_map(self, name):
+        if len(self.cache) == 0:
+            return {}
+        counts = self.cache.values()
+        avg = (self.base_count + sum(counts)) / (self.base_bins + len(counts))
+        min_, max_ = min(counts), max(counts)
+        num_min, num_max = 0, 0
+        if self.base_min <= min_:
+            min_ = self.base_min
+            num_min += self.min_count
+        if self.base_min >= min_:
+            num_min += sum(v == min_ for v in counts)
+
+        if self.base_max >= max_:
+            max_ = self.base_max
+            num_max += self.max_count
+        if self.base_max <= max_:
+            num_max += sum(v == max_ for v in counts)
+
+        return {
+            'avg_%s' % name: avg,
+            'min_%s' % name: min_,
+            'max_%s' % name: max_,
+            'num_min_%s' % name: num_min,
+            'num_max_%s' % name: num_max,
+        }
